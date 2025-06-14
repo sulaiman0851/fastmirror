@@ -5,75 +5,135 @@
 # Author: Sulaiman0851
 # =============================================
 
-### === DEBIAN/UBUNTU SECTION === ###
-APT_SOURCES="/etc/apt/sources.list"
-APT_SOURCES_BAK="/etc/apt/sources.list.bak"
+set -e
 
-APT_NEW_SOURCES=$(cat <<EOF
-deb http://deb.debian.org/debian bookworm main contrib non-free-firmware
-deb http://deb.debian.org/debian bookworm-updates main contrib non-free-firmware
-deb http://security.debian.org/debian-security bookworm-security main contrib non-free-firmware
-EOF
-)
+# ****** [ Color Codes ] ******
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RED="\e[31m"
+BLUE="\e[36m"
+NC="\e[0m"
 
-echo "[APT] Backing up existing sources.list..."
-if [[ -f "$APT_SOURCES" ]]; then
-    sudo cp "$APT_SOURCES" "$APT_SOURCES_BAK"
-    echo "[✓] Backup created: $APT_SOURCES_BAK"
+# ****** [ Logger Setup ] ******
+# 
+
+LOG_FILE="/var/log/fastmirror.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ****** [ Banner ] ******
+echo -e "${BLUE}"
+echo "# ============================================="
+echo "# FastMirror: Auto Update for apt & pacman"
+echo "# Author: Sulaiman0851"
+echo "# ============================================="
+echo -e "${NC}"
+
+# ****** [ Privilege Check ] ******
+if [[ "$EUID" -ne 0 ]]; then
+    if ! command -v sudo &>/dev/null; then
+        echo -e "${RED}[!] You must run this script as root or have 'sudo' installed.${NC}"
+        exit 1
+    fi
+    SUDO="sudo"
+else
+    SUDO=""
 fi
 
-echo "[APT] Updating sources.list with new mirrors..."
-echo "$APT_NEW_SOURCES" | sudo tee "$APT_SOURCES" > /dev/null
-echo "[✓] sources.list updated successfully!"
+# ****** [ GeoIP Mirror Detection ] ******
+COUNTRY=$(curl -s https://ipapi.co/country/ || echo "US")
+echo -e "${YELLOW}[i] Detected country: $COUNTRY${NC}"
 
-# === GPG KEYS FIX === #
-APT_KEYS=(
-    54404762BBB6E853
-    BDE6D2B9216EC7A8
-    0E98404D386FA1D9
-    6ED0E7B82643E131
-    F8D2585B783D3481
-)
+# ****** [ Distro Detection ] ******
+DISTRO_ID=$(grep ^ID= /etc/os-release | cut -d= -f2 | tr -d '"')
 
-echo "[APT] Importing GPG keys (if needed)..."
-for key in "${APT_KEYS[@]}"; do
-    sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys "$key"
-done
+### === DEBIAN/UBUNTU SECTION === ###
+if [[ "$DISTRO_ID" =~ ^(debian|ubuntu)$ ]]; then
+    echo -e "${GREEN}[APT] Detected Debian/Ubuntu system${NC}"
 
-echo "[APT] Running apt update..."
-sudo apt update
+    echo -e "${YELLOW}[*] Backing up /etc/apt/sources.list...${NC}"
+    $SUDO cp /etc/apt/sources.list /etc/apt/sources.list.bak
 
+    echo -e "${YELLOW}[*] Writing optimized mirror list...${NC}"
+    cat <<EOF | $SUDO tee /etc/apt/sources.list > /dev/null
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+EOF
 
-### === ARCHLINUX SECTION === ###
-PACMAN_TARGET="/etc/pacman.d/mirrorlist"
-PACMAN_BACKUP="/etc/pacman.d/mirrorlist.bak"
-PACMAN_TMP="/tmp/mirrorlist"
-ARCH_MIRROR="https://archlinux.org/mirrorlist/?country=ID&protocol=http&protocol=https&ip_version=4"
+    echo -e "${GREEN}[✔] sources.list updated!${NC}"
 
-if [[ -d "/etc/pacman.d" ]]; then
-    echo "[PACMAN] Fetching mirrorlist from Arch Linux..."
-    curl -sSL "$ARCH_MIRROR" -o "$PACMAN_TMP"
-
-    if [[ $? -ne 0 ]]; then
-        echo "[!] Failed to fetch Arch mirrorlist. Skipping..."
-    else
-        echo "[PACMAN] Activating all mirrors..."
-        sed -i 's/^#Server/Server/' "$PACMAN_TMP"
-
-        if [[ -f "$PACMAN_TARGET" ]]; then
-            echo "[PACMAN] Backup created: $PACMAN_BACKUP"
-            sudo cp "$PACMAN_TARGET" "$PACMAN_BACKUP"
-        fi
-
-        echo "[PACMAN] Replacing mirrorlist..."
-        sudo cp "$PACMAN_TMP" "$PACMAN_TARGET"
-
-        if [[ $? -eq 0 ]]; then
-            echo "[✓] Pacman mirrorlist updated successfully!"
+    # ****** [ Check & Offer GPG Install If Missing ] ******
+    if ! command -v gpg &>/dev/null; then
+        echo -e "${YELLOW}[!] GPG is not installed.${NC}"
+        read -p "Do you want to install 'gnupg' now? [Y/n]: " ans
+        ans=${ans:-Y}
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}[*] Installing gnupg...${NC}"
+            $SUDO apt update && $SUDO apt install -y gnupg
         else
-            echo "[!] Failed to copy new mirrorlist for pacman."
+            echo -e "${RED}[!] GPG is required to import keys. Aborting.${NC}"
+            exit 1
         fi
     fi
-fi
 
-echo "🎉 FastMirror completed!"
+    echo -e "${YELLOW}[*] Importing required GPG keys...${NC}"
+    KEYS=(
+        54404762BBB6E853
+        BDE6D2B9216EC7A8
+        0E98404D386FA1D9
+        6ED0E7B82643E131
+        F8D2585B783D3481
+    )
+
+    for KEY in "${KEYS[@]}"; do
+        echo -e "${YELLOW}[KEY] Importing: $KEY${NC}"
+        $SUDO gpg --keyserver keyserver.ubuntu.com --recv-keys $KEY || {
+            echo -e "${RED}[!] Failed to fetch GPG key: $KEY${NC}"
+            exit 1
+        }
+        $SUDO gpg --export $KEY | $SUDO tee /etc/apt/trusted.gpg.d/$KEY.gpg > /dev/null
+    done
+
+    echo -e "${GREEN}[APT] Running apt update...${NC}"
+    $SUDO apt update
+
+    echo -e "${GREEN}[✔] APT FastMirror completed!${NC}"
+
+### === ARCH/DERIVATIVE SECTION === ###
+elif [[ "$DISTRO_ID" =~ ^(arch|manjaro|endeavouros)$ ]]; then
+    echo -e "${GREEN}[PACMAN] Detected Arch-based system${NC}"
+
+    MIRROR_URL="https://archlinux.org/mirrorlist/?country=$COUNTRY&protocol=http&protocol=https&ip_version=4"
+    TMP_FILE="/tmp/mirrorlist"
+    TARGET_PATH="/etc/pacman.d/mirrorlist"
+    BACKUP_PATH="/etc/pacman.d/mirrorlist.bak"
+
+    echo -e "${YELLOW}[*] Fetching mirrorlist from Arch Linux...${NC}"
+    curl -sSL "$MIRROR_URL" -o "$TMP_FILE"
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[!] ERROR: Failed to retrieve mirrorlist.${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[*] Enabling all mirror entries...${NC}"
+    sed -i 's/^#Server/Server/' "$TMP_FILE"
+
+    if [[ -f "$TARGET_PATH" ]]; then
+        echo -e "${YELLOW}[*] Creating backup: $BACKUP_PATH${NC}"
+        $SUDO cp "$TARGET_PATH" "$BACKUP_PATH"
+    fi
+
+    echo -e "${YELLOW}[*] Copying new mirrorlist to $TARGET_PATH...${NC}"
+    $SUDO cp "$TMP_FILE" "$TARGET_PATH"
+
+    echo -e "${YELLOW}[*] Refreshing pacman database...${NC}"
+    $SUDO pacman -Syy
+
+    echo -e "${GREEN}[✔] PACMAN FastMirror completed!${NC}"
+
+else
+    echo -e "${RED}[✖] Unsupported distro ID: $DISTRO_ID${NC}"
+    echo -e "${RED}[!] This script supports Debian, Ubuntu, Arch, Manjaro, EndeavourOS only.${NC}"
+    exit 1
+fi
